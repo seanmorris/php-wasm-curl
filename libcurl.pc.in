@@ -1,0 +1,15 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+# SSL is left out on purpose: PHP's configure would try to run a program to
+# identify the TLS library, which cannot work when cross-compiling.
+supported_protocols="HTTP HTTPS"
+supported_features="IPv6 Largefile libz"
+
+Name: libcurl
+URL: https://github.com/seanmorris/php-wasm-curl
+Description: The libcurl API implemented over fetch() for Emscripten
+Version: @VERSION@
+Libs: -L${libdir} -lcurl
+Cflags: -I${includedir}
