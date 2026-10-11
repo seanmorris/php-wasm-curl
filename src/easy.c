@@ -73,6 +73,7 @@ static void lcf_default_options(Curl_easy *data)
 {
 	data->magic = LCF_EASY_MAGIC;
 	data->max_redirs = 30;
+	data->http_auth = CURLAUTH_BASIC;
 	data->no_progress = true;
 	data->post_field_size = -1;
 	data->in_file_size = -1;
@@ -322,6 +323,7 @@ static CURLcode lcf_setopt_pointer(Curl_easy *data, CURLoption option, void *val
 		case CURLOPT_READDATA: data->read_data = value; break;
 		case CURLOPT_XFERINFODATA: data->xferinfo_data = value; data->progress_data = value; break;
 		case CURLOPT_DEBUGDATA: data->debug_data = value; break;
+		case CURLOPT_STDERR: data->error_stream = value; break;
 		case CURLOPT_ERRORBUFFER: data->error_buffer = value; break;
 		case CURLOPT_PRIVATE: data->private_data = value; break;
 		default:

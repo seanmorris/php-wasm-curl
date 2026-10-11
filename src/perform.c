@@ -32,9 +32,8 @@ static void lcf_headers_remove(lcf_header_list *list, const char *name, size_t n
 	list->count = kept;
 }
 
-static int lcf_headers_set(lcf_header_list *list, const char *name, size_t name_length, const char *value)
+static int lcf_headers_append(lcf_header_list *list, const char *name, size_t name_length, const char *value)
 {
-	lcf_headers_remove(list, name, name_length);
 	lcf_header *items = realloc(list->items, (list->count + 1) * sizeof(lcf_header));
 	if(!items) return 0;
 	list->items = items;
@@ -42,6 +41,12 @@ static int lcf_headers_set(lcf_header_list *list, const char *name, size_t name_
 	list->items[list->count].value = lcf_strdup(value);
 	list->count++;
 	return 1;
+}
+
+static int lcf_headers_set(lcf_header_list *list, const char *name, size_t name_length, const char *value)
+{
+	lcf_headers_remove(list, name, name_length);
+	return lcf_headers_append(list, name, name_length, value);
 }
 
 static void lcf_headers_free(lcf_header_list *list)
@@ -147,9 +152,10 @@ static void lcf_debug_request(Curl_easy *data, const char *method, lcf_header_li
 	lcf_buffer_append(&text, "\r\n", 2);
 
 	data->request_size = (long)text.length;
-	if(data->verbose && data->debug_cb && text.data)
+	if(data->verbose && text.data)
 	{
-		data->debug_cb(data, CURLINFO_HEADER_OUT, text.data, text.length, data->debug_data);
+		if(data->debug_cb) data->debug_cb(data, CURLINFO_HEADER_OUT, text.data, text.length, data->debug_data);
+		else fwrite(text.data, 1, text.length, data->error_stream ? data->error_stream : stderr);
 	}
 	lcf_buffer_free(&text);
 }
@@ -195,6 +201,9 @@ CURLcode lcf_prepare(Curl_easy *data)
 {
 	if(!lcf_js_anchor) return CURLE_FAILED_INIT;
 	lcf_clear_results(data);
+	data->done = false;
+	data->result = CURLE_OK;
+	if(data->error_buffer) data->error_buffer[0] = '\0';
 
 	if(!data->url || !*data->url)
 	{
@@ -211,6 +220,14 @@ CURLcode lcf_prepare(Curl_easy *data)
 		lcf_set_error(data, CURLE_NOT_BUILT_IN, "Unix sockets are not supported by php-wasm-curl");
 		return CURLE_NOT_BUILT_IN;
 	}
+	bool custom_auth = lcf_has_header(data->http_headers, "Authorization");
+	if(!custom_auth && data->username && data->http_auth != CURLAUTH_NONE
+		&& !(data->http_auth & (CURLAUTH_BASIC | CURLAUTH_DIGEST))
+		&& !(data->bearer && (data->http_auth & CURLAUTH_BEARER)))
+	{
+		lcf_set_error(data, CURLE_NOT_BUILT_IN, "The requested HTTP authentication method is not supported");
+		return CURLE_NOT_BUILT_IN;
+	}
 
 	const char *method = lcf_method(data);
 	lcf_header_list headers = {0};
@@ -218,16 +235,18 @@ CURLcode lcf_prepare(Curl_easy *data)
 	bool has_body = false;
 	CURLcode code = CURLE_OK;
 
-	if(data->user_agent) lcf_headers_set(&headers, "User-Agent", 10, data->user_agent);
-	if(data->referer) lcf_headers_set(&headers, "Referer", 7, data->referer);
-	if(data->cookie) lcf_headers_set(&headers, "Cookie", 6, data->cookie);
-	if(data->range)
+	/* An explicit header replaces its generated default, while repeated
+	   explicit values must all reach fetch's Headers.append(). */
+	if(data->user_agent && !lcf_has_header(data->http_headers, "User-Agent")) lcf_headers_set(&headers, "User-Agent", 10, data->user_agent);
+	if(data->referer && !lcf_has_header(data->http_headers, "Referer")) lcf_headers_set(&headers, "Referer", 7, data->referer);
+	if(data->cookie && !lcf_has_header(data->http_headers, "Cookie")) lcf_headers_set(&headers, "Cookie", 6, data->cookie);
+	if(data->range && !lcf_has_header(data->http_headers, "Range"))
 	{
 		char range[256];
 		snprintf(range, sizeof(range), "bytes=%s", data->range);
 		lcf_headers_set(&headers, "Range", 5, range);
 	}
-	if(data->bearer && (data->http_auth & CURLAUTH_BEARER))
+	if(!custom_auth && data->bearer && (data->http_auth & CURLAUTH_BEARER))
 	{
 		size_t length = strlen(data->bearer) + 8;
 		char *value = malloc(length);
@@ -235,7 +254,7 @@ CURLcode lcf_prepare(Curl_easy *data)
 		lcf_headers_set(&headers, "Authorization", 13, value);
 		free(value);
 	}
-	else if(data->username)
+	else if(!custom_auth && data->username && (data->http_auth & CURLAUTH_BASIC) && !(data->http_auth & CURLAUTH_DIGEST))
 	{
 		size_t length = strlen(data->username) + (data->password ? strlen(data->password) : 0) + 2;
 		char *pair = malloc(length);
@@ -288,7 +307,7 @@ CURLcode lcf_prepare(Curl_easy *data)
 			while(*value == ' ' || *value == '\t') value++;
 			if(*value)
 			{
-				lcf_headers_set(&headers, line, colon - line, value);
+				lcf_headers_append(&headers, line, colon - line, value);
 			}
 			else
 			{
@@ -297,7 +316,7 @@ CURLcode lcf_prepare(Curl_easy *data)
 		}
 		else if(semicolon && semicolon[1] == '\0')
 		{
-			lcf_headers_set(&headers, line, semicolon - line, "");
+			lcf_headers_append(&headers, line, semicolon - line, "");
 		}
 	}
 
@@ -313,6 +332,8 @@ CURLcode lcf_prepare(Curl_easy *data)
 	data->request_id = id;
 	lcf_js_request_url(id, data->url);
 	lcf_js_request_method(id, method);
+	if(!custom_auth && data->username && (data->http_auth & CURLAUTH_DIGEST))
+		lcf_js_request_auth(id, data->username, data->password, !!(data->http_auth & CURLAUTH_BASIC));
 	for(size_t i = 0; i < headers.count; i++)
 	{
 		lcf_js_request_header(id, headers.items[i].name, headers.items[i].value);
@@ -345,7 +366,7 @@ CURLcode lcf_prepare(Curl_easy *data)
 	return code;
 }
 
-void lcf_free_result(lcf_result *result)
+static void lcf_free_result(lcf_result *result)
 {
 	free(result->status_text);
 	free(result->url);
@@ -359,6 +380,11 @@ void lcf_free_result(lcf_result *result)
 static CURLcode lcf_deliver_header(Curl_easy *data, const char *line, size_t length)
 {
 	data->header_size += (long)length;
+	if(data->verbose)
+	{
+		if(data->debug_cb) data->debug_cb(data, CURLINFO_HEADER_IN, (char *)line, length, data->debug_data);
+		else fwrite(line, 1, length, data->error_stream ? data->error_stream : stderr);
+	}
 	if(data->header_cb)
 	{
 		if(data->header_cb((char *)line, 1, length, data->header_data) != length) return CURLE_WRITE_ERROR;
@@ -380,16 +406,17 @@ static CURLcode lcf_deliver_header(Curl_easy *data, const char *line, size_t len
 static CURLcode lcf_progress(Curl_easy *data)
 {
 	if(data->no_progress) return CURLE_OK;
+	curl_off_t total = data->content_length_download > 0 ? data->content_length_download : 0;
 	if(data->xferinfo_cb)
 	{
-		if(data->xferinfo_cb(data->xferinfo_data, data->size_download, data->size_download, data->size_upload, data->size_upload))
+		if(data->xferinfo_cb(data->xferinfo_data, total, data->size_download, data->size_upload, data->size_upload))
 		{
 			return CURLE_ABORTED_BY_CALLBACK;
 		}
 	}
 	else if(data->progress_cb)
 	{
-		if(data->progress_cb(data->progress_data, (double)data->size_download, (double)data->size_download, (double)data->size_upload, (double)data->size_upload))
+		if(data->progress_cb(data->progress_data, (double)total, (double)data->size_download, (double)data->size_upload, (double)data->size_upload))
 		{
 			return CURLE_ABORTED_BY_CALLBACK;
 		}
@@ -397,20 +424,9 @@ static CURLcode lcf_progress(Curl_easy *data)
 	return CURLE_OK;
 }
 
-/* Copies the JavaScript result into the handle and replays it through the
-   libcurl callbacks, the way a real transfer would deliver it. */
-CURLcode lcf_finish(Curl_easy *data, lcf_result *result)
+/* Headers are delivered before JS is permitted to read the response body. */
+static CURLcode lcf_receive_headers(Curl_easy *data, lcf_result *result)
 {
-	data->total_time = (result->finished - result->started) / 1000.0;
-	data->starttransfer_time = (result->headers_at - result->started) / 1000.0;
-	lcf_set_string(&data->effective_url, result->url && *result->url ? result->url : data->url);
-
-	if(result->code != CURLE_OK)
-	{
-		lcf_set_error(data, result->code, result->error);
-		return result->code;
-	}
-
 	data->response_code = result->status;
 	data->http_version = CURL_HTTP_VERSION_1_1;
 	data->redirect_count = result->redirected;
@@ -424,10 +440,20 @@ CURLcode lcf_finish(Curl_easy *data, lcf_result *result)
 		return CURLE_HTTP_RETURNED_ERROR;
 	}
 
-	char status_line[512];
-	int status_length = snprintf(status_line, sizeof(status_line), "HTTP/1.1 %ld %s\r\n",
-		result->status, result->status_text ? result->status_text : "");
-	CURLcode code = lcf_deliver_header(data, status_line, (size_t)status_length);
+	char status_prefix[32];
+	snprintf(status_prefix, sizeof(status_prefix), "HTTP/1.1 %ld ", result->status);
+	const char *status_text = result->status_text ? result->status_text : "";
+	lcf_buffer status_line = {0};
+	if(!lcf_buffer_append(&status_line, status_prefix, strlen(status_prefix))
+		|| !lcf_buffer_append(&status_line, status_text, strlen(status_text))
+		|| !lcf_buffer_append(&status_line, "\r\n", 2))
+	{
+		lcf_buffer_free(&status_line);
+		lcf_set_error(data, CURLE_OUT_OF_MEMORY, NULL);
+		return CURLE_OUT_OF_MEMORY;
+	}
+	CURLcode code = lcf_deliver_header(data, status_line.data, status_line.length);
+	lcf_buffer_free(&status_line);
 
 	for(char *line = result->headers; code == CURLE_OK && line && *line;)
 	{
@@ -452,48 +478,61 @@ CURLcode lcf_finish(Curl_easy *data, lcf_result *result)
 
 	if(code == CURLE_OK) code = lcf_deliver_header(data, "\r\n", 2);
 
-	if(code == CURLE_OK && !data->nobody)
-	{
-		for(size_t offset = 0; offset < result->body_length; offset += LCF_CHUNK)
-		{
-			size_t length = result->body_length - offset;
-			if(length > LCF_CHUNK) length = LCF_CHUNK;
-			size_t written;
-			if(data->write_cb)
-			{
-				written = data->write_cb(result->body + offset, 1, length, data->write_data);
-			}
-			else
-			{
-				written = fwrite(result->body + offset, 1, length, data->write_data ? data->write_data : stdout);
-			}
-			if(written != length)
-			{
-				code = CURLE_WRITE_ERROR;
-				break;
-			}
-			data->size_download += (curl_off_t)length;
-		}
-	}
-
-	if(code == CURLE_OK) code = lcf_progress(data);
-	if(code != CURLE_OK) lcf_set_error(data, code, NULL);
 	return code;
 }
 
-CURLcode lcf_take(Curl_easy *data, lcf_result *result)
+static CURLcode lcf_receive_body(Curl_easy *data, lcf_result *result)
 {
-	int code = 0;
-	memset(result, 0, sizeof(lcf_result));
-	lcf_js_take_result(
-		data->request_id, &code, &result->status, &result->redirected, &result->status_text,
-		&result->url, &result->headers, &result->location, &result->error, &result->body,
-		&result->body_length, &result->started, &result->headers_at, &result->finished
+	if(data->nobody) return CURLE_OK;
+	for(size_t offset = 0; offset < result->body_length; offset += LCF_CHUNK)
+	{
+		size_t length = result->body_length - offset;
+		if(length > LCF_CHUNK) length = LCF_CHUNK;
+		size_t written = data->write_cb
+			? data->write_cb(result->body + offset, 1, length, data->write_data)
+			: fwrite(result->body + offset, 1, length, data->write_data ? data->write_data : stdout);
+		if(written != length) return CURLE_WRITE_ERROR;
+		data->size_download += (curl_off_t)length;
+		CURLcode code = lcf_progress(data);
+		if(code != CURLE_OK) return code;
+	}
+	return CURLE_OK;
+}
+
+/* Consume at most one event so other handles and Guzzle's promise queue get
+   control between chunks. Callbacks execute with Asyncify fully rewound. */
+void lcf_pump(Curl_easy *data)
+{
+	lcf_result result = {0};
+	int result_code = 0;
+	int kind = lcf_js_take_event(
+		data->request_id, &result_code, &result.status, &result.redirected, &result.status_text,
+		&result.url, &result.headers, &result.location, &result.error, &result.body,
+		&result.body_length, &result.started, &result.headers_at, &result.finished
 	);
-	result->code = (CURLcode)code;
-	lcf_js_request_free(data->request_id);
-	data->request_id = 0;
-	return result->code;
+	if(!kind) return;
+	data->total_time = (result.finished - result.started) / 1000.0;
+	data->starttransfer_time = (result.headers_at - result.started) / 1000.0;
+	if(result.url) lcf_set_string(&data->effective_url, result.url);
+
+	CURLcode code = (CURLcode)result_code;
+	if(code == CURLE_OK)
+	{
+		if(kind == LCF_EVENT_HEADERS) code = lcf_receive_headers(data, &result);
+		else if(kind == LCF_EVENT_BODY) code = lcf_receive_body(data, &result);
+		if(code == CURLE_OK && kind != LCF_EVENT_BODY) code = lcf_progress(data);
+	}
+	if(kind == LCF_EVENT_DONE || code != CURLE_OK)
+	{
+		data->result = code;
+		data->done = true;
+		if(code != CURLE_OK && (result.error || !data->error_buffer || !data->error_buffer[0]))
+			lcf_set_error(data, code, result.error);
+		lcf_js_request_free(data->request_id);
+		data->request_id = 0;
+	}
+	else lcf_js_continue(data->request_id);
+	lcf_free_result(&result);
 }
 
 CURL_EXTERN CURLcode curl_easy_perform(CURL *curl)
@@ -504,13 +543,11 @@ CURL_EXTERN CURLcode curl_easy_perform(CURL *curl)
 
 	CURLcode code = lcf_prepare(data);
 	if(code != CURLE_OK) return code;
-
-	int id = data->request_id;
-	lcf_js_fetch_all(&id, 1);
-
-	lcf_result result;
-	lcf_take(data, &result);
-	code = lcf_finish(data, &result);
-	lcf_free_result(&result);
-	return code;
+	lcf_js_start(data->request_id);
+	while(!data->done)
+	{
+		lcf_pump(data);
+		if(!data->done) lcf_js_wait(&data->request_id, 1, 1000);
+	}
+	return data->result;
 }

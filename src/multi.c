@@ -2,12 +2,8 @@
 #include <string.h>
 #include "internal.h"
 
-/*
- * A multi handle runs every pending transfer together: curl_multi_perform()
- * starts their fetches concurrently, waits for all of them, then replays each
- * response through its easy handle's callbacks. It always returns with no
- * transfers running, so curl_multi_wait() never has to block.
- */
+/* Fetch IO runs independently; perform pumps callbacks without waiting for IO.
+   wait/poll yield to JS until one of this multi handle's events is ready. */
 
 CURL_EXTERN CURLM *curl_multi_init(void)
 {
@@ -24,13 +20,20 @@ static int lcf_valid_multi(Curl_multi *multi)
 
 static void lcf_drop_messages_for(Curl_multi *multi, Curl_easy *data)
 {
-	size_t kept = multi->message_read;
+	/* Removing a handle also ends the lifetime of previously returned messages. */
+	size_t kept = 0;
 	for(size_t i = multi->message_read; i < multi->message_count; i++)
 	{
 		if(multi->messages[i].easy_handle == data) continue;
 		multi->messages[kept++] = multi->messages[i];
 	}
 	multi->message_count = kept;
+	multi->message_read = 0;
+	if(!kept)
+	{
+		free(multi->messages);
+		multi->messages = NULL;
+	}
 }
 
 CURL_EXTERN CURLMcode curl_multi_add_handle(CURLM *m, CURL *curl)
@@ -99,68 +102,55 @@ CURL_EXTERN CURLMcode curl_multi_perform(CURLM *m, int *running_handles)
 	Curl_multi *multi = m;
 	if(!lcf_valid_multi(multi)) return CURLM_BAD_HANDLE;
 
-	size_t pending = 0;
+	int running = 0;
 	for(Curl_easy *data = multi->first; data; data = data->next_in_multi)
 	{
-		if(!data->done) pending++;
-	}
-
-	if(pending)
-	{
-		int *ids = malloc(pending * sizeof(int));
-		Curl_easy **handles = malloc(pending * sizeof(Curl_easy *));
-		if(!ids || !handles)
+		if(data->done) continue;
+		if(!data->request_id)
 		{
-			free(ids);
-			free(handles);
-			return CURLM_OUT_OF_MEMORY;
-		}
-
-		size_t count = 0;
-		for(Curl_easy *data = multi->first; data; data = data->next_in_multi)
-		{
-			if(data->done) continue;
 			CURLcode code = lcf_prepare(data);
 			if(code != CURLE_OK)
 			{
 				data->done = true;
 				data->result = code;
-				lcf_queue_done(multi, data);
-				continue;
 			}
-			ids[count] = data->request_id;
-			handles[count] = data;
-			count++;
+			else lcf_js_start(data->request_id);
 		}
-
-		if(count) lcf_js_fetch_all(ids, (int)count);
-
-		for(size_t i = 0; i < count; i++)
+		if(!data->done) lcf_pump(data);
+		if(data->done)
 		{
-			Curl_easy *data = handles[i];
-			lcf_result result;
-			lcf_take(data, &result);
-			data->result = lcf_finish(data, &result);
-			lcf_free_result(&result);
-			data->done = true;
-			lcf_queue_done(multi, data);
+			if(!lcf_queue_done(multi, data)) return CURLM_OUT_OF_MEMORY;
 		}
-
-		free(ids);
-		free(handles);
+		else running++;
 	}
-
-	if(running_handles) *running_handles = 0;
+	if(running_handles) *running_handles = running;
 	return CURLM_OK;
 }
 
 CURL_EXTERN CURLMcode curl_multi_wait(CURLM *m, struct curl_waitfd extra_fds[], unsigned int extra_nfds, int timeout_ms, int *ret)
 {
 	(void)extra_fds;
-	(void)extra_nfds;
-	(void)timeout_ms;
-	if(!lcf_valid_multi(m)) return CURLM_BAD_HANDLE;
+	Curl_multi *multi = m;
+	if(!lcf_valid_multi(multi)) return CURLM_BAD_HANDLE;
+	if(timeout_ms < 0 || extra_nfds) return CURLM_BAD_FUNCTION_ARGUMENT;
 	if(ret) *ret = 0;
+	size_t count = 0;
+	for(Curl_easy *data = multi->first; data; data = data->next_in_multi)
+	{
+		/* A newly added handle needs perform() before waiting on existing IO.
+		   Guzzle can refill a pool between perform() and select(). */
+		if(!data->done && !data->request_id) return CURLM_OK;
+		if(data->request_id && !data->done) count++;
+	}
+	if(!count) return CURLM_OK;
+	int *ids = malloc(count * sizeof(int));
+	if(!ids) return CURLM_OUT_OF_MEMORY;
+	count = 0;
+	for(Curl_easy *data = multi->first; data; data = data->next_in_multi)
+		if(data->request_id && !data->done) ids[count++] = data->request_id;
+	int ready = lcf_js_wait(ids, (int)count, timeout_ms);
+	free(ids);
+	if(ret) *ret = ready;
 	return CURLM_OK;
 }
 

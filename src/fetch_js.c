@@ -16,7 +16,7 @@ int lcf_js_anchor = 1;
 EM_JS(int, lcf_js_request_new, (void), {
 	if(!Module.libcurlFetch)
 	{
-		Module.libcurlFetch = {nextId: 1, requests: new Map(), results: new Map()};
+		Module.libcurlFetch = {nextId: 1, requests: new Map(), waiters: new Set()};
 	}
 	const state = Module.libcurlFetch;
 	const id = state.nextId++;
@@ -30,8 +30,13 @@ EM_JS(int, lcf_js_request_new, (void), {
 EM_JS(void, lcf_js_request_free, (int id), {
 	const state = Module.libcurlFetch;
 	if(!state) return;
+	const request = state.requests.get(id);
+	if(!request) return;
+	request.cancelled = true;
+	if(request.controller) request.controller.abort();
+	if(request.resume) request.resume();
 	state.requests.delete(id);
-	state.results.delete(id);
+	for(const wake of Array.from(state.waiters)) wake();
 });
 
 EM_JS(void, lcf_js_request_url, (int id, const char *url), {
@@ -75,11 +80,9 @@ EM_JS(void, lcf_js_request_options, (int id, int follow, long max_redirs, long t
 	request.timeoutMs = timeout_ms;
 });
 
-/*
- * Runs every listed request concurrently and stores one result per id. Never
- * rejects: failures become results carrying a libcurl error code.
- */
-EM_ASYNC_JS(void, lcf_js_fetch_all, (const int *ids, int count), {
+/* Starts IO without suspending PHP. JS never invokes PHP callbacks while
+   Asyncify is unwound: C consumes one event per handle and acknowledges it. */
+EM_JS(void, lcf_js_start, (int id), {
 	const state = Module.libcurlFetch;
 	const CURLE_UNSUPPORTED_PROTOCOL = 1;
 	const CURLE_URL_MALFORMAT = 3;
@@ -88,10 +91,9 @@ EM_ASYNC_JS(void, lcf_js_fetch_all, (const int *ids, int count), {
 	const CURLE_OPERATION_TIMEDOUT = 28;
 	const CURLE_RECV_ERROR = 56;
 
-	/* Browsers hide redirect responses from fetch() ("opaqueredirect"), so
-	   there a redirect can only be followed. Server runtimes expose them. */
-	const canStopAtRedirect = !!(globalThis.process || globalThis.Deno || globalThis.Bun
-		|| (globalThis.navigator && globalThis.navigator.userAgent === 'Cloudflare-Workers'));
+	const browser = typeof globalThis.window !== 'undefined'
+		|| (typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope);
+	const canStopAtRedirect = !browser;
 
 	/* fetch() computes or forbids these itself. */
 	const skippedHeaders = new Set([
@@ -106,6 +108,21 @@ EM_ASYNC_JS(void, lcf_js_fetch_all, (const int *ids, int count), {
 			headers: "", location: "", error: "", body: new Uint8Array(0),
 			started, headersAt: started, finished: started};
 
+		const publish = event => {
+			if(request.cancelled) return;
+			request.event = event;
+			for(const wake of Array.from(state.waiters)) wake();
+		};
+		const deliver = async (kind, body) => {
+			await new Promise(resolve => {
+				request.resume = resolve;
+				publish({...result, kind, body: body || new Uint8Array(0), finished: performance.now()});
+			});
+			request.resume = null;
+			if(request.cancelled || request.controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+		};
+		const finish = () => publish({...result, kind: 3, finished: performance.now()});
+
 		let parsed;
 		try
 		{
@@ -115,14 +132,14 @@ EM_ASYNC_JS(void, lcf_js_fetch_all, (const int *ids, int count), {
 		{
 			result.code = CURLE_URL_MALFORMAT;
 			result.error = 'URL rejected: ' + request.url;
-			return result;
+			return finish();
 		}
 
 		if(parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
 		{
 			result.code = CURLE_UNSUPPORTED_PROTOCOL;
 			result.error = 'Protocol "' + parsed.protocol.slice(0, -1) + '" not supported by php-wasm-curl';
-			return result;
+			return finish();
 		}
 
 		if(request.port > 0)
@@ -145,53 +162,136 @@ EM_ASYNC_JS(void, lcf_js_fetch_all, (const int *ids, int count), {
 		let body = undefined;
 		if(request.form)
 		{
-			body = new FormData();
+			/* FormData string fields transcode UTF-8 and normalize line endings.
+			   Serialize the envelope ourselves so every part keeps its raw bytes. */
+			const boundary = '----php-wasm-curl-' + Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+			const quoted = value => value.split(String.fromCharCode(13)).join('%0D')
+				.split(String.fromCharCode(10)).join('%0A').split(String.fromCharCode(34)).join('%22');
+			const chunks = [];
 			for(const part of request.form)
 			{
-				if(part.filename === undefined)
+				let disposition = '--' + boundary + '\r\nContent-Disposition: form-data; name="' + quoted(part.name) + '"';
+				if(part.filename !== undefined)
 				{
-					body.append(part.name, new TextDecoder().decode(part.data));
+					const type = new Blob([], {type: part.type}).type || 'application/octet-stream';
+					disposition += '; filename="' + quoted(part.filename) + '"\r\nContent-Type: ' + type;
 				}
-				else
-				{
-					body.append(part.name, new Blob([part.data], {type: part.type}), part.filename);
-				}
+				chunks.push(disposition + '\r\n\r\n', part.data, '\r\n');
 			}
-			headers.delete('content-type');
+			chunks.push('--' + boundary + '--\r\n');
+			body = new Blob(chunks);
+			headers.set('content-type', 'multipart/form-data; boundary=' + boundary);
 		}
 		else if(request.body)
 		{
 			body = request.body;
 		}
 
-		const method = request.method.toUpperCase();
+		const method = new Request(parsed.href, {method: request.method}).method;
 		if(method === 'GET' || method === 'HEAD')
 		{
 			body = undefined;
 		}
 
 		let redirect = 'manual';
-		if(request.follow || !canStopAtRedirect)
+		if(!canStopAtRedirect)
 		{
-			redirect = request.follow && request.maxRedirs === 0 ? 'error' : 'follow';
+			redirect = request.follow && request.maxRedirs !== 0 ? 'follow' : 'manual';
 		}
 
-		const init = {method: request.method, headers, body, redirect};
-		let timer = null;
-		if(request.timeoutMs > 0)
+		const controller = request.controller = new AbortController();
+		controller.signal.addEventListener('abort', () => { if(request.resume) request.resume(); });
+		const init = {method, headers, body, redirect, signal: controller.signal};
+		if(browser)
 		{
-			const controller = new AbortController();
-			timer = setTimeout(() => controller.abort(), request.timeoutMs);
-			init.signal = controller.signal;
+			const policy = (Module.libcurlFetchOptions || {}).credentials || 'same-origin';
+			if(!['omit', 'same-origin', 'include'].includes(policy))
+			{
+				result.code = 43;
+				result.error = 'Invalid libcurlFetchOptions.credentials';
+				return finish();
+			}
+			init.credentials = policy;
 		}
+		let timer = null;
+		if(request.timeoutMs > 0) timer = setTimeout(() => controller.abort(), request.timeoutMs);
 
 		try
 		{
-			const response = await fetch(parsed.href, init);
+			let response;
+			let currentURL = parsed;
+			let followed = 0;
+			let authAttempts = 0;
+			for(;;)
+			{
+				response = await fetch(currentURL.href, init);
+				const responseURL = new URL(response.url || currentURL.href);
+				if(response.status === 401 && request.auth && responseURL.origin === parsed.origin && authAttempts < 2)
+				{
+					const challenge = response.headers.get('www-authenticate') || "";
+					const digest = await state.digest(challenge, request.auth, init.method, responseURL, init.body);
+					if(digest && (!authAttempts || digest.stale || responseURL.href !== currentURL.href))
+					{
+						if(response.body) await response.body.cancel();
+						headers.set('authorization', digest.header);
+						currentURL = responseURL;
+						authAttempts++;
+						continue;
+					}
+				}
+				if(!canStopAtRedirect || !request.follow
+					|| ![301, 302, 303, 307, 308].includes(response.status)) break;
+				const location = response.headers.get('location');
+				if(location === null) break;
+				if(response.body) await response.body.cancel();
+				if(request.maxRedirs >= 0 && followed >= request.maxRedirs)
+				{
+					result.code = CURLE_TOO_MANY_REDIRECTS;
+					result.error = 'Maximum (' + request.maxRedirs + ') redirects followed';
+					result.url = currentURL.href;
+					return finish();
+				}
+				const nextURL = new URL(location, currentURL);
+				if(nextURL.protocol !== 'http:' && nextURL.protocol !== 'https:')
+				{
+					result.code = CURLE_UNSUPPORTED_PROTOCOL;
+					result.error = 'Redirect protocol is not supported by php-wasm-curl';
+					return finish();
+				}
+				/* Match fetch's credential stripping and method/body transitions. */
+				if(nextURL.origin !== currentURL.origin)
+				{
+					headers.delete('authorization');
+					headers.delete('proxy-authorization');
+					headers.delete('cookie');
+				}
+				const previousMethod = init.method.toUpperCase();
+				if(((response.status === 301 || response.status === 302) && previousMethod === 'POST')
+					|| (response.status === 303 && previousMethod !== 'GET' && previousMethod !== 'HEAD'))
+				{
+					init.method = 'GET';
+					init.body = undefined;
+					for(const name of ['content-encoding', 'content-language', 'content-location', 'content-type'])
+					{
+						headers.delete(name);
+					}
+				}
+				currentURL = nextURL;
+				if(request.auth) headers.delete('authorization');
+				authAttempts = 0;
+				followed++;
+			}
+			if(response.type === 'opaqueredirect')
+			{
+				result.code = request.follow ? CURLE_TOO_MANY_REDIRECTS : 4;
+				result.error = request.follow ? 'Maximum (0) redirects followed'
+					: 'Browser Fetch cannot expose a redirect response; redirect was not followed';
+				return finish();
+			}
 			result.headersAt = performance.now();
 			result.status = response.status;
 			result.statusText = response.statusText;
-			result.redirected = response.redirected ? 1 : 0;
+			result.redirected = canStopAtRedirect ? followed : (response.redirected ? 1 : 0);
 			result.url = response.url || parsed.href;
 
 			const decoded = response.headers.has('content-encoding');
@@ -200,7 +300,9 @@ EM_ASYNC_JS(void, lcf_js_fetch_all, (const int *ids, int count), {
 			{
 				/* fetch() always decodes the body, so drop headers that describe the
 				   encoded bytes; clients would otherwise try to decode it again. */
-				if(decoded && (name === 'content-encoding' || name === 'content-length')) continue;
+				if(decoded && name === 'content-encoding') continue;
+				/* CORS may hide Content-Encoding while exposing the encoded length. */
+				if((decoded || response.type === 'cors') && name === 'content-length') continue;
 				if(name === 'set-cookie') continue;
 				lines.push(name + ': ' + value);
 			}
@@ -216,27 +318,41 @@ EM_ASYNC_JS(void, lcf_js_fetch_all, (const int *ids, int count), {
 				result.location = location ? new URL(location, result.url).href : "";
 			}
 
-			const buffer = new Uint8Array(await response.arrayBuffer());
-			if(decoded)
-			{
-				lines.push('content-length: ' + buffer.length);
-			}
 			result.headers = lines.join('\r\n') + (lines.length ? '\r\n' : "");
-			result.body = buffer;
+			await deliver(1);
+			/* Backpressure bounds queued data and lets callbacks abort before
+			   reading more. No JS callback re-enters suspended WebAssembly. */
+			if(response.body)
+			{
+				const reader = response.body.getReader();
+				try
+				{
+					for(;;)
+					{
+						const chunk = await reader.read();
+						if(chunk.done) break;
+						for(let offset = 0; offset < chunk.value.length; offset += 16384)
+						{
+							await deliver(2, chunk.value.subarray(offset, offset + 16384));
+						}
+					}
+				}
+				finally { reader.releaseLock(); }
+			}
 		}
 		catch(error)
 		{
 			const message = error && error.message ? error.message : String(error);
 			const cause = error && error.cause && error.cause.message ? ' (' + error.cause.message + ')' : "";
-			if(error && error.name === 'AbortError')
+			if(error && error.curlCode)
+			{
+				result.code = error.curlCode;
+				result.error = error.message;
+			}
+			else if(error && error.name === 'AbortError')
 			{
 				result.code = CURLE_OPERATION_TIMEDOUT;
 				result.error = 'Operation timed out after ' + request.timeoutMs + ' milliseconds';
-			}
-			else if(redirect === 'error' && /redirect/i.test(message + cause))
-			{
-				result.code = CURLE_TOO_MANY_REDIRECTS;
-				result.error = 'Maximum (0) redirects followed';
 			}
 			else if(result.status)
 			{
@@ -252,51 +368,85 @@ EM_ASYNC_JS(void, lcf_js_fetch_all, (const int *ids, int count), {
 		finally
 		{
 			if(timer) clearTimeout(timer);
+			result.finished = performance.now();
 		}
 
-		result.finished = performance.now();
-		return result;
+		return finish();
 	};
 
-	const list = [];
-	for(let i = 0; i < count; i++)
-	{
-		list.push(getValue(ids + i * 4, 'i32'));
-	}
-
-	const results = await Promise.all(list.map(run));
-	list.forEach((id, i) => state.results.set(id, results[i]));
+	/* All failures, including invalid Headers/Blob options, become curl errors. */
+	run(id).catch(error => {
+		const request = state.requests.get(id);
+		if(!request || request.cancelled) return;
+		request.event = {kind: 3, code: 7, error: String(error), started: performance.now(), finished: performance.now()};
+		for(const wake of Array.from(state.waiters)) wake();
+	});
 });
 
-/* Moves one stored result into C. Every returned string or buffer is malloc'd. */
-EM_JS(void, lcf_js_take_result, (int id, int *code, long *status, long *redirected, char **status_text, char **url, char **headers, char **location, char **error, char **body, size_t *body_length, double *started, double *headers_at, double *finished), {
-	const state = Module.libcurlFetch;
-	const result = state.results.get(id);
-	state.results.delete(id);
+EM_JS(void, lcf_js_continue, (int id), {
+	const request = Module.libcurlFetch.requests.get(id);
+	if(request && request.resume) request.resume();
+});
 
+EM_ASYNC_JS(int, lcf_js_wait, (const int *ids, int count, int timeout_ms), {
+	const state = Module.libcurlFetch;
+	if(!state || !count) return 0;
+	const list = [];
+	for(let i = 0; i < count; i++) list.push(getValue(ids + i * 4, 'i32'));
+	const ready = () => list.filter(id => { const request = state.requests.get(id); return request && request.event; }).length;
+	if(ready()) return ready();
+	return await new Promise(resolve => {
+		let timer;
+		const wake = () => {
+			const found = ready();
+			if(!found && list.some(id => state.requests.has(id))) return;
+			clearTimeout(timer);
+			state.waiters.delete(wake);
+			resolve(found);
+		};
+		state.waiters.add(wake);
+		timer = setTimeout(() => { state.waiters.delete(wake); resolve(ready()); }, Math.max(0, timeout_ms));
+		wake();
+	});
+});
+
+/* Moves one event into C. It is acknowledged only after its callbacks return. */
+EM_JS(int, lcf_js_take_event, (int id, int *code, long *status, long *redirected, char **status_text, char **url, char **headers, char **location, char **error, char **body, size_t *body_length, double *started, double *headers_at, double *finished), {
+	const state = Module.libcurlFetch;
+	const request = state.requests.get(id);
+	if(!request || !request.event) return 0;
+	const result = request.event;
+	request.event = null;
+
+	let outOfMemory = false;
 	const toC = value => {
+		if(!value) return 0;
 		const length = lengthBytesUTF8(value) + 1;
 		const pointer = _malloc(length);
+		if(!pointer) { outOfMemory = true; return 0; }
 		stringToUTF8(value, pointer, length);
 		return pointer;
 	};
 
-	setValue(code, result.code, 'i32');
-	setValue(status, result.status, 'i32');
-	setValue(redirected, result.redirected, 'i32');
-	setValue(status_text, toC(result.statusText), '*');
+	setValue(code, result.code || 0, 'i32');
+	setValue(status, result.status || 0, 'i32');
+	setValue(redirected, result.redirected || 0, 'i32');
+	setValue(status_text, toC(result.kind === 1 ? result.statusText : null), '*');
 	setValue(url, toC(result.url), '*');
-	setValue(headers, toC(result.headers), '*');
+	setValue(headers, toC(result.kind === 1 ? result.headers : null), '*');
 	setValue(location, toC(result.location), '*');
 	setValue(error, toC(result.error), '*');
 
-	const bodyPointer = _malloc(result.body.length + 1);
-	HEAPU8.set(result.body, bodyPointer);
-	HEAPU8[bodyPointer + result.body.length] = 0;
+	const bytes = result.body || new Uint8Array(0);
+	const bodyPointer = bytes.length ? _malloc(bytes.length) : 0;
+	if(bytes.length && bodyPointer) HEAPU8.set(bytes, bodyPointer);
+	else if(bytes.length) outOfMemory = true;
 	setValue(body, bodyPointer, '*');
-	setValue(body_length, result.body.length, 'i32');
+	setValue(body_length, bytes.length, 'i32');
 
 	setValue(started, result.started, 'double');
-	setValue(headers_at, result.headersAt, 'double');
+	setValue(headers_at, result.headersAt || result.started, 'double');
 	setValue(finished, result.finished, 'double');
+	if(outOfMemory) { setValue(code, 27, 'i32'); return 3; }
+	return result.kind;
 });

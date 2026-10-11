@@ -24,7 +24,19 @@ build/main.js: main.c build/api.so
 check: build/main.js
 	$(NODE) run.mjs
 
+PHP_SRC ?=
+PHP_CURL_SOURCES = $(wildcard $(PHP_SRC)/ext/curl/*.c $(PHP_SRC)/ext/curl/*.h $(PHP_SRC)/main/php_config.h)
+
+build/php8.4-curl.so: ../build/libcurl.a guzzle/build-extension.sh $(PHP_CURL_SOURCES) | build
+	bash guzzle/build-extension.sh "$(PHP_SRC)" "$@"
+
+check-guzzle: build/php8.4-curl.so
+	NODE="$(NODE)" bash guzzle/run.sh
+
+check-browser: build/php8.4-curl.so
+	$(NODE) guzzle/browser-run.mjs
+
 clean:
 	rm -rf build
 
-.PHONY: all check clean
+.PHONY: all check check-guzzle check-browser clean

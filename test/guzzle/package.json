@@ -1,0 +1,15 @@
+{
+  "name": "php-wasm-curl-guzzle-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bash run.sh",
+    "test:browser": "node browser-run.mjs"
+  },
+  "dependencies": {
+    "php-wasm": "0.2.0"
+  },
+  "devDependencies": {
+    "playwright": "1.64.0"
+  }
+}

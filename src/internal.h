@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <curl/curl.h>
 
 #define LCF_EASY_MAGIC  0x4c434645u /* "LCFE" */
@@ -35,7 +36,8 @@ struct curl_mime {
 	struct curl_mimepart *last;
 };
 
-/* What a finished request reports back from JavaScript. */
+/* Events are consumed by C, then acknowledged before JS reads another chunk. */
+enum { LCF_EVENT_NONE, LCF_EVENT_HEADERS, LCF_EVENT_BODY, LCF_EVENT_DONE };
 typedef struct lcf_result {
 	CURLcode code;
 	long status;
@@ -100,6 +102,7 @@ typedef struct Curl_easy {
 	void *progress_data;
 	curl_debug_callback debug_cb;
 	void *debug_data;
+	FILE *error_stream;              /* Borrowed (CURLOPT_STDERR). */
 	char *error_buffer;              /* Borrowed, CURL_ERROR_SIZE bytes. */
 	void *private_data;
 
@@ -147,9 +150,7 @@ void lcf_set_error(Curl_easy *data, CURLcode code, const char *message);
 
 /* perform.c */
 CURLcode lcf_prepare(Curl_easy *data);
-CURLcode lcf_finish(Curl_easy *data, lcf_result *result);
-void lcf_free_result(lcf_result *result);
-CURLcode lcf_take(Curl_easy *data, lcf_result *result);
+void lcf_pump(Curl_easy *data);
 
 /* fetch_js.c */
 extern int lcf_js_anchor;
@@ -157,13 +158,16 @@ int lcf_js_request_new(void);
 void lcf_js_request_free(int id);
 void lcf_js_request_url(int id, const char *url);
 void lcf_js_request_method(int id, const char *method);
+void lcf_js_request_auth(int id, const char *username, const char *password, int basic_allowed);
 void lcf_js_request_header(int id, const char *name, const char *value);
 void lcf_js_request_body(int id, const char *body, size_t length);
 void lcf_js_request_form_field(int id, const char *name, const char *data, size_t length);
 void lcf_js_request_form_file(int id, const char *name, const char *data, size_t length, const char *filename, const char *type);
 void lcf_js_request_options(int id, int follow, long max_redirs, long timeout_ms, long port);
-void lcf_js_fetch_all(const int *ids, int count);
-void lcf_js_take_result(
+void lcf_js_start(int id);
+void lcf_js_continue(int id);
+int lcf_js_wait(const int *ids, int count, int timeout_ms);
+int lcf_js_take_event(
 	int id, int *code, long *status, long *redirected, char **status_text, char **url,
 	char **headers, char **location, char **error, char **body, size_t *body_length,
 	double *started, double *headers_at, double *finished

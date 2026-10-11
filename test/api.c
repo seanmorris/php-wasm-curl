@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <malloc.h>
 #include <curl/curl.h>
 
 static int failures = 0;
@@ -81,6 +82,22 @@ static void test_header_in_body(void)
 	curl_easy_cleanup(curl);
 }
 
+static void test_long_status(void)
+{
+	sink body = {0}, headers = {0};
+	CURL *curl = easy("/long-status", &body, &headers);
+	char expected[640];
+	size_t prefix = (size_t)snprintf(expected, sizeof(expected), "HTTP/1.1 200 ");
+	memset(expected + prefix, 'A', 600);
+	memcpy(expected + prefix + 600, "\r\n", 3);
+	size_t length = strlen(expected);
+	CHECK(curl_easy_perform(curl) == CURLE_OK, "long HTTP reason phrase succeeds");
+	CHECK(headers.length >= length && memcmp(headers.data, expected, length) == 0,
+		"header callback receives the complete long status line without stack bytes");
+	CHECK(strcmp(body.data, "long status") == 0, "long status leaves response body intact");
+	curl_easy_cleanup(curl);
+}
+
 static void test_post(void)
 {
 	sink body = {0};
@@ -100,6 +117,55 @@ static void test_post(void)
 	CHECK(strstr(body.data, "application/x-www-form-urlencoded") != NULL, "default form content type");
 	CHECK(strstr(body.data, "\"user-agent\":\"lcf-test\"") != NULL, "CURLOPT_USERAGENT");
 	curl_slist_free_all(list);
+	curl_easy_cleanup(curl);
+}
+
+static void test_request_headers(void)
+{
+	sink body = {0};
+	CURL *curl = easy("/echo", &body, NULL);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, "default-agent");
+	curl_easy_setopt(curl, CURLOPT_COOKIE, "default=removed");
+	curl_easy_setopt(curl, CURLOPT_USERPWD, "user:secret");
+	struct curl_slist *headers = NULL;
+	headers = curl_slist_append(headers, "X-Values: one");
+	headers = curl_slist_append(headers, "x-values: two");
+	headers = curl_slist_append(headers, "X-Empty;");
+	headers = curl_slist_append(headers, "User-Agent: custom-agent");
+	headers = curl_slist_append(headers, "Cookie:");
+	headers = curl_slist_append(headers, "Authorization: Bearer custom");
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	CHECK(curl_easy_perform(curl) == CURLE_OK, "custom request headers succeed");
+	CHECK(strstr(body.data, "\"x-values\":\"one, two\"") != NULL, "repeated request header values are preserved");
+	CHECK(strstr(body.data, "\"x-empty\":\"\"") != NULL, "semicolon sends an empty header");
+	CHECK(strstr(body.data, "\"user-agent\":\"custom-agent\"") && !strstr(body.data, "default-agent"),
+		"custom headers replace option-generated defaults");
+	CHECK(!strstr(body.data, "\"cookie\""), "empty colon header suppresses an option-generated default");
+	CHECK(strstr(body.data, "\"authorization\":\"Bearer custom\"") != NULL, "explicit authorization overrides generated Basic auth");
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+}
+
+static void test_debug_stream(void)
+{
+	sink body = {0};
+	CURL *curl = easy("/hello", &body, NULL);
+	FILE *debug = tmpfile();
+	CHECK(debug != NULL, "debug stream opens");
+	if(debug)
+	{
+		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+		curl_easy_setopt(curl, CURLOPT_STDERR, debug);
+		CHECK(curl_easy_perform(curl) == CURLE_OK, "verbose transfer succeeds");
+		rewind(debug);
+		char text[2048];
+		size_t length = fread(text, 1, sizeof(text) - 1, debug);
+		text[length] = '\0';
+		CHECK(strstr(text, "GET /hello HTTP/1.1") != NULL, "verbose request reaches CURLOPT_STDERR");
+		CHECK(strstr(text, "HTTP/1.1 200") != NULL, "verbose response reaches CURLOPT_STDERR");
+		curl_easy_setopt(curl, CURLOPT_STDERR, NULL);
+		fclose(debug);
+	}
 	curl_easy_cleanup(curl);
 }
 
@@ -140,6 +206,35 @@ static void test_custom_and_auth(void)
 	curl_easy_cleanup(curl);
 }
 
+static void test_auth_restrictions(void)
+{
+	const long methods[] = {CURLAUTH_NONE, CURLAUTH_DIGEST, CURLAUTH_ANYSAFE, CURLAUTH_BASIC};
+	const char *names[] = {"NONE", "DIGEST", "ANYSAFE", "BASIC"};
+	for(size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++)
+	{
+		sink body = {0}, observed = {0};
+		char path[64], label[128];
+		snprintf(path, sizeof(path), "/auth-probe?id=%zu", i);
+		CURL *curl = easy(path, &body, NULL);
+		curl_easy_setopt(curl, CURLOPT_USERPWD, "user:secret");
+		CURLcode code = curl_easy_setopt(curl, CURLOPT_HTTPAUTH, methods[i]);
+		if(code == CURLE_OK) code = curl_easy_perform(curl);
+		/* An unimplemented auth method may be rejected, but must not downgrade. */
+		int unsupported = (i == 1 || i == 2) && code == CURLE_NOT_BUILT_IN;
+		snprintf(label, sizeof(label), "CURLAUTH_%s succeeds or explicitly rejects an unsupported method", names[i]);
+		CHECK(code == CURLE_OK || unsupported, label);
+		curl_easy_cleanup(curl);
+
+		/* Check the server even on failure: returning an error cannot undo a leak. */
+		snprintf(path, sizeof(path), "/auth-observed?id=%zu", i);
+		curl = easy(path, &observed, NULL);
+		code = curl_easy_perform(curl);
+		snprintf(label, sizeof(label), "CURLAUTH_%s sends Basic credentials only when allowed", names[i]);
+		CHECK(code == CURLE_OK && strcmp(observed.data, methods[i] == CURLAUTH_BASIC ? "1" : "0") == 0, label);
+		curl_easy_cleanup(curl);
+	}
+}
+
 static void test_redirects(void)
 {
 	sink body = {0};
@@ -165,6 +260,44 @@ static void test_redirects(void)
 	CHECK(effective && strstr(effective, "/final"), "CURLINFO_EFFECTIVE_URL after redirect");
 	CHECK(count == 1, "CURLINFO_REDIRECT_COUNT");
 	curl_easy_cleanup(curl);
+}
+
+static void test_redirect_limits(void)
+{
+	const struct {
+		long limit;
+		int hops;
+		CURLcode code;
+		const char *visits;
+	} cases[] = {
+		{0, 1, CURLE_TOO_MANY_REDIRECTS, "1"},
+		{1, 1, CURLE_OK, "2"},
+		{1, 2, CURLE_TOO_MANY_REDIRECTS, "2"},
+		{2, 2, CURLE_OK, "3"},
+		{-1, 2, CURLE_OK, "3"},
+	};
+	for(size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+	{
+		sink body = {0}, visits = {0};
+		char path[96], label[128];
+		snprintf(path, sizeof(path), "/redirect-chain?id=%zu&remaining=%d", i, cases[i].hops);
+		CURL *curl = easy(path, &body, NULL);
+		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+		curl_easy_setopt(curl, CURLOPT_MAXREDIRS, cases[i].limit);
+		CURLcode code = curl_easy_perform(curl);
+		snprintf(label, sizeof(label), "MAXREDIRS=%ld enforces the result for %d redirects", cases[i].limit, cases[i].hops);
+		CHECK(code == cases[i].code, label);
+		CHECK(cases[i].code == CURLE_OK ? strcmp(body.data, "final") == 0 : body.length == 0,
+			"redirect limit prevents delivery of an over-limit final response");
+		curl_easy_cleanup(curl);
+
+		snprintf(path, sizeof(path), "/redirect-visits?id=%zu", i);
+		curl = easy(path, &visits, NULL);
+		code = curl_easy_perform(curl);
+		CHECK(code == CURLE_OK && strcmp(visits.data, cases[i].visits) == 0,
+			"redirect limit stops requests before visiting an over-limit destination");
+		curl_easy_cleanup(curl);
+	}
 }
 
 static void test_errors(void)
@@ -256,6 +389,28 @@ static void test_mime(void)
 	curl_easy_cleanup(curl);
 }
 
+static void test_mime_binary_field(void)
+{
+	/* Invalid UTF-8, an embedded NUL, and lone line endings must remain bytes. */
+	const unsigned char bytes[] = {0xff, 0x00, 0x80, 'A', '\n', 'B', '\r', 'C'};
+	sink body = {0};
+	CURL *curl = easy("/echo-bytes", &body, NULL);
+	curl_mime *mime = curl_mime_init(curl);
+	curl_mimepart *part = curl_mime_addpart(mime);
+	curl_mime_name(part, "binary");
+	curl_mime_data(part, (const char *)bytes, sizeof(bytes));
+	curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+	CHECK(curl_easy_perform(curl) == CURLE_OK, "binary multipart field upload succeeds");
+	char *content = strstr(body.data, "\r\n\r\n");
+	if(content) content += 4;
+	CHECK(content && body.length >= (size_t)(content - body.data) + sizeof(bytes) + 4
+		&& memcmp(content, bytes, sizeof(bytes)) == 0
+		&& memcmp(content + sizeof(bytes), "\r\n--", 4) == 0,
+		"multipart field preserves every byte without UTF-8 or newline conversion");
+	curl_easy_cleanup(curl);
+	curl_mime_free(mime);
+}
+
 static void test_multi(void)
 {
 	CURLM *multi = curl_multi_init();
@@ -299,6 +454,66 @@ static void test_multi(void)
 	curl_multi_cleanup(multi);
 }
 
+static int multi_failure_round(CURLM *multi, CURL *curl)
+{
+	int running = 1, queued = -1;
+	if(curl_multi_add_handle(multi, curl) != CURLM_OK) return 0;
+	if(curl_multi_perform(multi, &running) != CURLM_OK || running != 0) return 0;
+	CURLMsg *message = curl_multi_info_read(multi, &queued);
+	if(!message || message->msg != CURLMSG_DONE || message->easy_handle != curl
+		|| message->data.result != CURLE_URL_MALFORMAT || queued != 0) return 0;
+	if(curl_multi_info_read(multi, &queued) != NULL || queued != 0) return 0;
+	return curl_multi_remove_handle(multi, curl) == CURLM_OK;
+}
+
+static void test_multi_reuse_memory(void)
+{
+	CURLM *multi = curl_multi_init();
+	/* Missing URLs exercise the completion queue without network allocations. */
+	CURL *curl = curl_easy_init();
+	int valid = 1;
+	for(int i = 0; valid && i < 128; i++) valid = multi_failure_round(multi, curl);
+	size_t before = (size_t)mallinfo().uordblks;
+	for(int i = 0; valid && i < 2048; i++) valid = multi_failure_round(multi, curl);
+	size_t after = (size_t)mallinfo().uordblks;
+	CHECK(valid, "reused multi handle emits exactly one completion per transfer");
+	/* Allow allocator slack, but not one retained CURLMsg per completed request. */
+	CHECK(after <= before + 4096, "drained multi completion queue uses bounded memory");
+	curl_multi_cleanup(multi);
+	curl_easy_cleanup(curl);
+}
+
+typedef struct {
+	size_t received, largest_chunk, peak_allocated;
+} stream_measurement;
+
+static size_t discard_stream(char *bytes, size_t size, size_t count, void *context)
+{
+	(void)bytes;
+	stream_measurement *measure = context;
+	size_t length = size * count;
+	measure->received += length;
+	if(length > measure->largest_chunk) measure->largest_chunk = length;
+	size_t allocated = (size_t)mallinfo().uordblks;
+	if(allocated > measure->peak_allocated) measure->peak_allocated = allocated;
+	return length;
+}
+
+static void test_stream_memory(void)
+{
+	sink unused = {0};
+	CURL *curl = easy("/stream?id=memory&chunks=64&size=65536&ms=1", &unused, NULL);
+	stream_measurement measure = {0};
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_stream);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &measure);
+	size_t baseline = (size_t)mallinfo().uordblks;
+	CHECK(curl_easy_perform(curl) == CURLE_OK, "large streamed download succeeds");
+	CHECK(measure.received == 4194304, "stream callbacks receive every byte");
+	CHECK(measure.largest_chunk <= CURL_MAX_WRITE_SIZE, "stream callbacks respect CURL_MAX_WRITE_SIZE");
+	CHECK(measure.peak_allocated <= baseline + 131072, "streaming does not buffer the full response in the WASM heap");
+	curl_easy_cleanup(curl);
+}
+
 static void test_misc(void)
 {
 	char *escaped = curl_easy_escape(NULL, "a b&c/ü", 0);
@@ -327,13 +542,21 @@ int run_tests(int port)
 	curl_global_init(CURL_GLOBAL_DEFAULT);
 	test_get();
 	test_header_in_body();
+	test_long_status();
 	test_post();
+	test_request_headers();
+	test_debug_stream();
 	test_upload();
 	test_custom_and_auth();
+	test_auth_restrictions();
 	test_redirects();
+	test_redirect_limits();
 	test_errors();
 	test_mime();
+	test_mime_binary_field();
 	test_multi();
+	test_multi_reuse_memory();
+	test_stream_memory();
 	test_misc();
 	curl_global_cleanup();
 	printf("1..%d\n", number);

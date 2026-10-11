@@ -14,7 +14,7 @@ CFLAGS ?= -O2
 LIBCURL_FETCH_CFLAGS = -fPIC -Iinclude -DCURL_DISABLE_TYPECHECK -DCURL_NO_OLDIES -Wall -Wno-deprecated-declarations
 VERSION = $(shell sed -n 's/^\#define LIBCURL_VERSION "\(.*\)"/\1/p' include/curl/curlver.h)
 
-SOURCES = src/easy.c src/perform.c src/multi.c src/mime.c src/version.c src/fetch_js.c
+SOURCES = src/easy.c src/perform.c src/multi.c src/mime.c src/version.c src/fetch_js.c src/digest_js.c
 OBJECTS = $(patsubst src/%.c,build/%.o,$(SOURCES))
 
 all: build/libcurl.a build/libcurl.pc
@@ -27,7 +27,7 @@ build/%.o: src/%.c src/internal.h | build
 
 # EM_JS bodies are only found in native objects: an LTO (bitcode) object in an
 # archive leaves its JavaScript functions undefined when linking executables.
-build/fetch_js.o: src/fetch_js.c src/internal.h | build
+build/fetch_js.o build/digest_js.o: build/%.o: src/%.c src/internal.h | build
 	$(CC) $(filter-out -flto,$(CFLAGS)) $(LIBCURL_FETCH_CFLAGS) -c $< -o $@
 
 build/libcurl.a: $(OBJECTS)
@@ -46,7 +46,13 @@ install: all
 check: all
 	$(MAKE) -C test check
 
+guzzle-extension: all
+	$(MAKE) -C test build/php8.4-curl.so
+
+check-guzzle check-browser: guzzle-extension
+	$(MAKE) -C test $@
+
 clean:
 	rm -rf build
 
-.PHONY: all install check clean
+.PHONY: all install check guzzle-extension check-guzzle check-browser clean
